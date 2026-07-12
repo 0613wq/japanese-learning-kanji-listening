@@ -1,9 +1,21 @@
 # ═══════════════════════════════════════════════════
-# 日语单词听力练习系统 v5.0
+# 日语单词听力练习系统 v5.1
 #   ✧ 词类分离（汉字词 / 动词）
 #   ✧ 临时单词表（集中复习卡词）
 #   ✧ 释义显示 + AI 提示词生成
 #   ✧ GitHub Gist 云端同步
+#
+# v5.1 修复：
+#   1. 【核心】Streamlit Cloud 段错误的根因是 requirements.txt 未锁版本，
+#      老版 streamlit==1.39 被 uv 装上了全新的 pyarrow==25（二进制不兼容），
+#      进程启动即 Segmentation fault。→ 必须同时更新 requirements.txt（见文件）。
+#   2. AI 释义页「全选/清空」按钮逻辑：原来在 multiselect 实例化之后才改
+#      picked，导致界面与实际选词不一致；现改为在控件实例化前写入 state。
+#   3. 练习会话：若所选词全部已是 1 级（掌握），初始队列为空会白屏卡死；
+#      现在会自动跳过空组 / 直接进入完成页。
+#   4. 词汇编辑表：保存/重分组/清临时后给 data_editor 换 key，
+#      避免旧编辑状态叠加到新数据上造成错乱。
+#   5. 循环朗读页并发提示与实际并发数(6)不一致的文案修正。
 # ═══════════════════════════════════════════════════
 import streamlit as st
 import streamlit.components.v1 as components
@@ -528,7 +540,7 @@ def _default_record_title(category, words, source):
 
 
 # ═══════════════════════════════════════════════════
-# SessionManager  ——  练习会话（逻辑与 v4 一致）
+# SessionManager  ——  练习会话
 # ═══════════════════════════════════════════════════
 _INIT_STATE    = {0: 3, 1: 1, 2: 2, 3: 3}
 _REAPPEAR      = {3: [('near', 4, 8), ('medium', 14, 22)], 2: [('medium', 10, 17)], 1: []}
@@ -557,6 +569,11 @@ class SessionManager:
         self.q_pos       = 0
         self.in_loop     = False
         self._build_queue()
+        # 修复：若起始组全部已是 1 级掌握（队列为空），自动推进，
+        # 否则界面会白屏卡死在空队列上
+        while not self.queue and not self.is_done():
+            if self._advance() == 'session_done':
+                break
 
     def _build_queue(self):
         gid  = self.group_order[self.g_idx]
@@ -1039,6 +1056,7 @@ _LOOP_PLAYER_HTML = r"""<!DOCTYPE html>
 
   function updateDisplay() {
     const w = currentWord();
+    if (!w) return;
     wordTextEl.textContent    = w.word;
     meaningTextEl.textContent = w.meaning || '（无释义）';
 
@@ -1054,15 +1072,16 @@ _LOOP_PLAYER_HTML = r"""<!DOCTYPE html>
 
     infoEl.innerHTML =
       '第 <b>' + loopCount + '</b> 轮  ·  ' +
-      (wordIdx + 1) + ' / ' + N +
+      (wordIdx + 1) + ' / ' + order.length +
       '  ·  ' + (subIdx === 0 ? '🇯🇵 日语' : '🇨🇳 中文') +
       '  ·  第 ' + (cycleIdx + 1) + '/' + cfg.repeat + ' 次';
-    progFill.style.width = ((wordIdx / N) * 100).toFixed(1) + '%';
+    progFill.style.width = ((wordIdx / Math.max(order.length, 1)) * 100).toFixed(1) + '%';
     updateRemovedUI();
   }
 
   function currentB64() {
     const w = currentWord();
+    if (!w) return '';
     return subIdx === 0 ? w.jp_b64 : w.cn_b64;
   }
 
@@ -1085,7 +1104,7 @@ _LOOP_PLAYER_HTML = r"""<!DOCTYPE html>
     // 阶段 1: JP 刚播完
     if (subIdx === 0) {
       const w = currentWord();
-      if (cfg.cn_mode !== 'none' && w.cn_b64) {
+      if (w && cfg.cn_mode !== 'none' && w.cn_b64) {
         subIdx = 1;
         advTimer = setTimeout(function() {
           updateDisplay();
@@ -1128,7 +1147,7 @@ _LOOP_PLAYER_HTML = r"""<!DOCTYPE html>
         btnPlay.textContent = '✅ 全部剔除';
         wordTextEl.textContent    = '🎉 已剔除全部词';
         meaningTextEl.textContent = '点「💾 保存记录」';
-        updateDisplay();
+        updateRemovedUI();
         return;
       }
     }
@@ -1154,6 +1173,7 @@ _LOOP_PLAYER_HTML = r"""<!DOCTYPE html>
   });
 
   btnPlay.addEventListener('click', function() {
+    if (order.length === 0) return;
     playing = !playing;
     if (playing) {
       btnPlay.textContent = '⏸ 暂停';
@@ -1320,6 +1340,8 @@ def _init():
         'last_audio_word':  '',
         'last_file_id':     '',
         'last_file_result': None,
+        # 编辑表版本号：保存后 +1 用于重置 data_editor 的内部状态
+        'editor_ver':       0,
         # Gist 状态
         'gist_id':          None,
         'gist_last_sync':   None,
@@ -1367,7 +1389,7 @@ if (not st.session_state.gist_auto_loaded
 
 
 # ═══════════════════════════════════════════════════
-# 内存管理 —— 关键修复
+# 内存管理
 # 循环播放的音频数据可能有 20-50 MB（base64），常驻 session_state 会导致
 # 每次 rerun 都拖着这坨数据处理，最终触发 Streamlit Cloud 的内存/段错误。
 # 只要当前不在循环播放页，就主动清掉。
@@ -1578,7 +1600,7 @@ def _panel_edit():
         return
 
     st.subheader(f"✏️ 编辑词汇  ·  {CATEGORIES[cat]}")
-    st.caption("可直接修改读み、释义、分组、等级、临时标记；删除行后点「保存修改」生效。")
+    st.caption("可直接修改読み、释义、分组、等级、临时标记；删除行后点「保存修改」生效。")
 
     df = pd.DataFrame([{
         '单词':  w['word'],
@@ -1589,6 +1611,9 @@ def _panel_edit():
         '临时':  bool(w.get('in_temp', False)),
     } for w in cat_words])
 
+    # 修复：key 里带版本号，保存/重分组后 +1，避免 data_editor
+    # 把旧的编辑状态叠加到新数据上
+    editor_key = f'word_editor_tbl_{cat}_v{st.session_state.editor_ver}'
     edited = st.data_editor(
         df,
         column_config={
@@ -1604,7 +1629,7 @@ def _panel_edit():
         use_container_width=True,
         num_rows='dynamic',
         height=min(600, 44 + 36 * len(cat_words)),
-        key=f'word_editor_tbl_{cat}',
+        key=editor_key,
         hide_index=False,
     )
 
@@ -1641,6 +1666,7 @@ def _panel_edit():
             # 合并回全库：其他分类保留不动
             other = [w for w in store.words if w.get('category', 'kanji') != cat]
             store.words = other + new_cat_words
+            st.session_state.editor_ver += 1   # 重置编辑器状态
             st.success(f'✅ 保存完成  ·  修改 {changed} 词  ·  删除 {deleted} 词  ·  该分类剩余 {len(new_cat_words)} 词')
             if _gist_enabled():
                 do_gist_save()
@@ -1651,6 +1677,7 @@ def _panel_edit():
         if st.button(f'🗑 清空临时（{n_temp}）', use_container_width=True,
                      disabled=(n_temp == 0)):
             store.clear_temp(cat)
+            st.session_state.editor_ver += 1
             st.success(f'✅ 已清空 {n_temp} 个临时标记')
             if _gist_enabled():
                 do_gist_save()
@@ -1671,6 +1698,7 @@ def _panel_edit():
     st.caption(f"将生成 **{n_grps}** 组，最后一组约 {total_after - (n_grps-1)*int(new_gs)} 词")
     if st.button('🔄 执行重新分组', use_container_width=True):
         store.regroup(int(new_gs), cat, int(start_g))
+        st.session_state.editor_ver += 1
         st.success(f'✅ 已分为 {n_grps} 组（组 {start_g} ~ {start_g+n_grps-1}）')
         if _gist_enabled():
             do_gist_save()
@@ -1708,11 +1736,25 @@ def _panel_ai():
     # ① 选词
     st.markdown("**① 选择要生成释义的词**")
     all_options = [w['word'] for w in no_meaning]
-    default_pick = all_options[:min(60, len(all_options))]
+    ms_key = f"ai_pick_{cat}"
+
+    # 修复：「全选/清空」必须在 multiselect 实例化【之前】写入 session_state，
+    # 原版在控件之后才改 picked 变量，界面上永远不会更新，且逻辑与显示不一致。
+    if st.session_state.pop("_ai_force_all", False):
+        st.session_state[ms_key] = list(all_options)
+    if st.session_state.pop("_ai_force_none", False):
+        st.session_state[ms_key] = []
+    if ms_key in st.session_state:
+        # 清掉已不在候选列表里的词（比如刚保存过释义的），否则 multiselect 会报错
+        _opt_set = set(all_options)
+        st.session_state[ms_key] = [w for w in st.session_state[ms_key] if w in _opt_set]
+    else:
+        st.session_state[ms_key] = all_options[:min(60, len(all_options))]
+
     picked = st.multiselect(
         "选词",
         all_options,
-        default=default_pick,
+        key=ms_key,
         label_visibility="collapsed",
     )
     ca, cb, cc = st.columns(3)
@@ -1723,11 +1765,6 @@ def _panel_ai():
         st.session_state["_ai_force_none"] = True
         st.rerun()
     cc.caption(f"已选 {len(picked)} / {len(all_options)}")
-
-    if st.session_state.pop("_ai_force_all", False):
-        picked = all_options
-    if st.session_state.pop("_ai_force_none", False):
-        picked = []
 
     if not picked:
         st.info("请至少选择一个词。")
@@ -1820,6 +1857,11 @@ def _panel_study():
         st.warning("⚠️ 无词匹配，请调整筛选条件")
         return
     st.caption(f"共 **{len(ws)}** 词符合条件")
+
+    # 修复：若选出的词全部已是 1 级（掌握），会话会立即结束、原版直接白屏
+    if all(w['long_level'] == 1 for w in ws):
+        st.warning("⚠️ 所选词全部已是 1 级（掌握），没有需要练习的词。请把等级筛选调整为包含 0/2/3 级。")
+        return
 
     # ② 练习模式 + 批次大小
     st.caption("**② 练习模式与分组大小**")
@@ -2022,11 +2064,15 @@ def _panel_loop():
     # ── ③ 估算 & 启动 ──
     st.markdown("**③ 生成音频并开始**")
     n_audio = len(ws) + (n_with_meaning if cn_mode != 'none' else 0)
-    est_sec = max(4, int(n_audio * 0.5 / 12))
+    # 修复：估算与提示按真实并发数(_LOOP_TTS_CONCURRENCY=6)计算，原文案写死"12 路"
+    est_sec = max(4, int(n_audio * 0.6 / _LOOP_TTS_CONCURRENCY))
     st.caption(
         f"共需生成 **{n_audio}** 个音频片段  ·  预计约 **{est_sec} 秒**"
-        f"（并发 12 路，词数越多耗时越久）"
+        f"（并发 {_LOOP_TTS_CONCURRENCY} 路，词数越多耗时越久）"
     )
+    if len(ws) > 150:
+        st.warning("⚠️ 词数较多：音频会常驻内存，Streamlit Cloud 免费版内存有限，"
+                   "建议一次不超过 150 词，否则可能触发资源限制导致应用重启。")
 
     if st.button("🎵 生成音频并开始循环", type="primary", use_container_width=True):
         with st.spinner(f"🎵 正在生成 {n_audio} 个音频..."):
@@ -2118,6 +2164,7 @@ def screen_loop_playing():
     if not audio_data or not config:
         st.session_state.phase = 'main'
         st.rerun()
+        return
 
     cat = meta.get('category', st.session_state.category)
     st.title("🔁 循环朗读中")
@@ -2197,7 +2244,7 @@ def screen_loop_playing():
                 if _gist_enabled():
                     do_gist_save()
                 st.success(f"✅ 已保存记录：**{rec['title']}**")
-                # 清空输入框
+                # 清空输入框（删除已实例化控件的 state 是允许的，下次 rerun 会重置）
                 st.session_state.pop("_loop_save_record_json", None)
                 st.session_state.pop("_loop_save_record_title", None)
             except Exception as e:
@@ -2230,12 +2277,21 @@ def screen_session():
     if not sess:
         st.session_state.phase = 'main'
         st.rerun()
+        return
 
     cat  = st.session_state.category
     store = st.session_state.store
     s    = sess.stats()
     word = sess.current_word()
+    # 修复：原版此处 `if not word: return` 会白屏卡死。
+    # 队列空 = 要么全部完成（去完成页），要么状态异常（回主页）。
     if not word:
+        if sess.is_done():
+            st.session_state.phase = 'done'
+        else:
+            st.session_state.phase   = 'main'
+            st.session_state.session = None
+        st.rerun()
         return
 
     audio_key = f"{word}::{st.session_state.speed}"
@@ -2316,8 +2372,7 @@ def screen_session():
 
     # ── 临时列表按钮（独立一行·醒目）──
     temp_label = "⭐ 已在临时列表 · 点击移出" if is_temp else "☆ 加入临时列表"
-    temp_type  = "secondary" if is_temp else "secondary"
-    if st.button(temp_label, use_container_width=True, type=temp_type,
+    if st.button(temp_label, use_container_width=True, type="secondary",
                  key=f"temp_btn_{word}"):
         new_val = store.toggle_temp(word, cat)
         w_obj['in_temp'] = new_val
@@ -2391,6 +2446,7 @@ def screen_group_done():
     if not sess:
         st.session_state.phase = 'main'
         st.rerun()
+        return
 
     s     = sess.stats()
     carry = sess.last_carryover
@@ -2427,6 +2483,7 @@ def screen_done():
     if not sess:
         st.session_state.phase = 'main'
         st.rerun()
+        return
 
     s = sess.stats()
     st.balloons()
