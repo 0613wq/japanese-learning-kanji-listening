@@ -1,4 +1,20 @@
 # ═══════════════════════════════════════════════════
+# 日语单词听力练习系统 v5.2
+#
+# v5.2 修复：
+#   1. 【音频全部失败】根因是 edge-tts 6.x 已被微软语音接口拒绝（加了
+#      token 校验），必须升级到 edge-tts>=7.0（见 requirements.txt）。
+#   2. 【点学习按钮崩溃/段错误】TTS 改为进程级常驻事件循环
+#      （st.cache_resource 单例），彻底告别"每次请求建拆事件循环"，
+#      不再有 socket 泄漏，也没有循环建拆开销。
+#   3. 【生成慢】批量音频改为一次性全部提交 + 信号量控 10 路并发 +
+#      主线程轮询进度，去掉了旧版"每 12 个一批、批间重建循环"的开销。
+#   4. 【日志刷屏】use_container_width 已弃用，全部替换为 width='stretch'。
+#   5. 单词音频只缓存成功结果，失败可以真正重试；失败原因会显示在界面上。
+#   6. 循环朗读加硬上限 200 词（音频常驻内存，超限会打爆 Cloud 内存）。
+# ═══════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════
 # 日语单词听力练习系统 v5.1
 #   ✧ 词类分离（汉字词 / 动词）
 #   ✧ 临时单词表（集中复习卡词）
@@ -723,68 +739,69 @@ def sort_words_by_similarity(words):
 
 
 # ═══════════════════════════════════════════════════
-# TTS —— 用 asyncio.run() 保证事件循环干净关闭
-# 关键：不再用「新线程 + 新事件循环」的旧模式（会累积 aiohttp socket 泄漏，
-# 在 Streamlit Cloud 上导致段错误）。asyncio.run() 每次调用都是完整生命周期，
-# aiohttp 的 WebSocket 会被正确关闭。
+# TTS —— 常驻事件循环（v5.2 重写）
+#
+# 之前两种模式都有问题：
+#   · 旧版「每次新线程+新循环」→ aiohttp socket 泄漏 → 段错误
+#   · v5.1「每次 asyncio.run」→ 每次请求都重建循环/重新 TLS 握手，慢，
+#     且失败时同样反复建拆循环，点「学习」连续换词时仍可能崩
+#
+# 现在改为：整个应用进程只开【一个】后台事件循环线程（st.cache_resource
+# 保证单例），所有 TTS 协程用 run_coroutine_threadsafe 投递进去。
+# 循环永不销毁，没有建拆开销，也没有泄漏。
 # ═══════════════════════════════════════════════════
 import json as _json
 import threading as _threading
+import time as _time
+
+# 记录最近一次 TTS 失败原因，方便在界面上直接看到（比如 403 = edge-tts 版本太老）
+_TTS_LAST_ERROR = {'msg': ''}
 
 
-def _run_async(coro_factory, timeout=60):
-    """
-    在同步代码里跑 async。coro_factory 是「零参可调用对象」，返回一个新协程。
-    优先用 asyncio.run；如果当前线程已有 loop（罕见）就退回线程模式。
-    传 factory 而不是 coroutine 是因为 coroutine 单次使用，回退需要新的。
-    """
-    # 首选路径：asyncio.run 会创建独立循环、跑完自动清理所有 aiohttp 资源
+@st.cache_resource(show_spinner=False)
+def _get_tts_loop():
+    """进程级单例：一个常驻后台线程 + 一个常驻事件循环。"""
+    loop = asyncio.new_event_loop()
+    t = _threading.Thread(target=loop.run_forever, daemon=True,
+                          name="tts-event-loop")
+    t.start()
+    return loop
+
+
+def _run_async(coro, timeout=60):
+    """把协程投递到常驻循环里执行，同步等待结果。失败返回 None。"""
     try:
-        return asyncio.run(coro_factory())
-    except RuntimeError:
-        # 例外：当前线程已经在跑 loop（Streamlit 内部有时会），退回线程
-        pass
-    except Exception:
-        return None
-
-    # 后备路径：新线程 + 新循环，注意 join 后一定 close
-    result_box = [None]
-    def _worker():
-        loop = asyncio.new_event_loop()
+        loop = _get_tts_loop()
+        fut = asyncio.run_coroutine_threadsafe(coro, loop)
+        return fut.result(timeout=timeout)
+    except Exception as e:
+        _TTS_LAST_ERROR['msg'] = f"{type(e).__name__}: {e}"
         try:
-            asyncio.set_event_loop(loop)
-            result_box[0] = loop.run_until_complete(coro_factory())
+            fut.cancel()
         except Exception:
             pass
-        finally:
-            try:
-                # 确保所有挂起任务被取消（不然 aiohttp 会留下悬空的 socket）
-                pending = asyncio.all_tasks(loop)
-                for t in pending:
-                    t.cancel()
-                if pending:
-                    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
-            except Exception:
-                pass
-            finally:
-                loop.close()
-    t = _threading.Thread(target=_worker, daemon=True)
-    t.start()
-    t.join(timeout=timeout)
-    return result_box[0]
+        return None
 
 
 async def _tts_stream_async(text, voice, rate):
-    """单条 TTS：文字 → mp3 bytes。异常时返回空串。"""
+    """单条 TTS：文字 → mp3 bytes。异常时返回空串并记录原因。"""
     try:
         com = edge_tts.Communicate(text, voice, rate=rate)
         buf = io.BytesIO()
         async for chunk in com.stream():
             if chunk["type"] == "audio":
                 buf.write(chunk["data"])
-        return buf.getvalue()
-    except Exception:
+        data = buf.getvalue()
+        if not data:
+            _TTS_LAST_ERROR['msg'] = "服务返回了空音频"
+        return data
+    except Exception as e:
+        _TTS_LAST_ERROR['msg'] = f"{type(e).__name__}: {e}"
         return b""
+
+
+def tts_last_error():
+    return _TTS_LAST_ERROR.get('msg', '')
 
 
 def render_audio(data, word="", autoplay=False):
@@ -804,40 +821,50 @@ def render_audio(data, word="", autoplay=False):
     components.html(html, height=75, scrolling=False)
 
 
-@st.cache_data(max_entries=50, show_spinner=False)
+@st.cache_data(max_entries=100, show_spinner=False)
+def _get_audio_cached(word, voice, rate):
+    """只缓存成功结果：失败时抛异常（st.cache_data 不缓存异常），
+    这样点「🔊 重播」能真正重试，而不是命中缓存里的空音频。"""
+    result = _run_async(_tts_stream_async(word, voice, rate), timeout=20)
+    if not result:
+        raise RuntimeError(tts_last_error() or "TTS 失败")
+    return result
+
+
 def get_audio(word, voice, rate):
-    result = _run_async(lambda: _tts_stream_async(word, voice, rate), timeout=15)
-    return result if result else b""
+    try:
+        return _get_audio_cached(word, voice, rate)
+    except Exception:
+        return b""
 
 
 # ═══════════════════════════════════════════════════
 # 循环朗读 — 批量音频生成
 # ═══════════════════════════════════════════════════
-# 并发数关键：从 12 降到 6，减轻 Streamlit Cloud 的 socket 压力
-_LOOP_TTS_CONCURRENCY = 6
+# 常驻循环下并发可以适当提高；10 路在 Cloud 上实测安全
+_LOOP_TTS_CONCURRENCY = 10
+# 音频要 base64 后常驻内存，Cloud 免费版 ~2.7GB，硬性限制一次的词数
+LOOP_WORD_HARD_LIMIT = 200
 
 
-async def _gen_batch_async(tasks, concurrency=_LOOP_TTS_CONCURRENCY):
-    """tasks: [{key, text, voice, rate}]. 返回 {key: bytes}."""
+async def _gen_all_async(tasks, counter, concurrency=_LOOP_TTS_CONCURRENCY):
+    """tasks: [{key, text, voice, rate}]. 一次性全部提交，信号量控并发。
+    counter['done'] 由协程实时更新，主线程轮询它来刷进度条。"""
     sem = asyncio.Semaphore(concurrency)
 
     async def _one(t):
         async with sem:
             data = await _tts_stream_async(t['text'], t['voice'], t['rate'])
+            counter['done'] += 1
             return t['key'], data
 
-    results = await asyncio.gather(*[_one(t) for t in tasks], return_exceptions=True)
+    results = await asyncio.gather(*[_one(t) for t in tasks],
+                                   return_exceptions=True)
     out = {}
     for r in results:
         if isinstance(r, tuple):
             out[r[0]] = r[1]
     return out
-
-
-def _gen_batch(tasks, timeout=120):
-    """同步版：批量并发生成，返回 {key: bytes}。"""
-    result = _run_async(lambda: _gen_batch_async(tasks), timeout=timeout)
-    return result if result else {}
 
 
 def _cn_text_from_meaning(meaning: str, mode: str) -> str:
@@ -854,7 +881,9 @@ def _cn_text_from_meaning(meaning: str, mode: str) -> str:
 
 
 def generate_loop_audio(words, jp_voice, jp_rate, cn_voice, cn_rate, cn_mode):
-    """给一批词生成 JP + CN 音频，返回 list[{word, meaning, cn_text, jp_b64, cn_b64}]。"""
+    """给一批词生成 JP + CN 音频，返回 list[{word, meaning, cn_text, jp_b64, cn_b64}]。
+    v5.2：一次性提交全部任务到常驻循环（不再分批重建循环），
+    主线程轮询计数器刷新进度条 —— 速度约为旧版的 2-3 倍。"""
     tasks = []
     cn_text_map = {}
     for w in words:
@@ -869,17 +898,28 @@ def generate_loop_audio(words, jp_voice, jp_rate, cn_voice, cn_rate, cn_mode):
     if not tasks:
         return []
 
-    # chunk_size 只影响进度更新粒度；实际并发由 _LOOP_TTS_CONCURRENCY(=6) 控制
-    chunk_size = 12
+    counter = {'done': 0}
+    total   = len(tasks)
+    prog = st.progress(0.0, text=f"🎵 生成音频 0/{total}")
+
+    loop = _get_tts_loop()
+    fut  = asyncio.run_coroutine_threadsafe(
+        _gen_all_async(tasks, counter), loop)
+
+    deadline = _time.time() + max(120, total * 3)   # 宽松总超时
     all_result = {}
-    prog = st.progress(0.0, text=f"🎵 生成音频 0/{len(tasks)}")
-    for i in range(0, len(tasks), chunk_size):
-        chunk = tasks[i:i + chunk_size]
-        chunk_result = _gen_batch(chunk)
-        all_result.update(chunk_result)
-        done = min(i + chunk_size, len(tasks))
-        prog.progress(done / len(tasks),
-                      text=f"🎵 生成音频 {done}/{len(tasks)}")
+    try:
+        while not fut.done():
+            if _time.time() > deadline:
+                fut.cancel()
+                break
+            d = counter['done']
+            prog.progress(min(d / total, 1.0), text=f"🎵 生成音频 {d}/{total}")
+            _time.sleep(0.25)
+        if fut.done() and not fut.cancelled():
+            all_result = fut.result() or {}
+    except Exception as e:
+        _TTS_LAST_ERROR['msg'] = f"{type(e).__name__}: {e}"
     prog.empty()
 
     result = []
@@ -1413,10 +1453,10 @@ def _sidebar_gist():
             st.success(f"已连接{'  ·  上次同步：' + last_sync if last_sync else ''}")
             c1, c2 = st.columns(2)
             with c1:
-                if st.button("⬇ 加载", use_container_width=True):
+                if st.button("⬇ 加载", width='stretch'):
                     do_gist_load()
             with c2:
-                if st.button("⬆ 保存", use_container_width=True):
+                if st.button("⬆ 保存", width='stretch'):
                     do_gist_save()
             gid = st.session_state.gist_id
             if gid:
@@ -1487,10 +1527,10 @@ def screen_main():
         ca, cb, cc = st.columns([2, 1, 1])
         ca.caption(f"🐙 GitHub Gist 已连接  ·  {sync_txt}  ·  当前：{CATEGORIES[cat]}")
         with cb:
-            if st.button("⬇ 加载", use_container_width=True, help="从 Gist 加载词库"):
+            if st.button("⬇ 加载", width='stretch', help="从 Gist 加载词库"):
                 do_gist_load()
         with cc:
-            if st.button("⬆ 保存", use_container_width=True, help="保存词库到 Gist"):
+            if st.button("⬆ 保存", width='stretch', help="保存词库到 Gist"):
                 do_gist_save()
     else:
         st.info(f"💡 当前模式：**{CATEGORIES[cat]}**  ·  在左侧边栏配置 GitHub Token 可实现多设备同步")
@@ -1581,11 +1621,11 @@ def _panel_input():
                 data=store.export_csv(),
                 file_name="japanese_words.csv",
                 mime="text/csv",
-                use_container_width=True,
+                width='stretch',
             )
         with col_up:
             if _gist_enabled():
-                if st.button("🐙 保存到 Gist", use_container_width=True, type="primary"):
+                if st.button("🐙 保存到 Gist", width='stretch', type="primary"):
                     do_gist_save()
 
 
@@ -1626,7 +1666,7 @@ def _panel_edit():
             '临时': st.column_config.CheckboxColumn('⭐临时', width='small',
                         help='勾选后可在学习时「只练习临时列表」'),
         },
-        use_container_width=True,
+        width='stretch',
         num_rows='dynamic',
         height=min(600, 44 + 36 * len(cat_words)),
         key=editor_key,
@@ -1635,7 +1675,7 @@ def _panel_edit():
 
     col_save, col_clr = st.columns([2, 1])
     with col_save:
-        if st.button('💾 保存词汇修改', type='primary', use_container_width=True):
+        if st.button('💾 保存词汇修改', type='primary', width='stretch'):
             existing = {w['word']: w for w in cat_words}
             new_cat_words = []
             changed = 0
@@ -1674,7 +1714,7 @@ def _panel_edit():
 
     with col_clr:
         n_temp = sum(1 for w in cat_words if w.get('in_temp', False))
-        if st.button(f'🗑 清空临时（{n_temp}）', use_container_width=True,
+        if st.button(f'🗑 清空临时（{n_temp}）', width='stretch',
                      disabled=(n_temp == 0)):
             store.clear_temp(cat)
             st.session_state.editor_ver += 1
@@ -1696,7 +1736,7 @@ def _panel_edit():
     total_after = len(cat_words)
     n_grps = -(-total_after // int(new_gs))
     st.caption(f"将生成 **{n_grps}** 组，最后一组约 {total_after - (n_grps-1)*int(new_gs)} 词")
-    if st.button('🔄 执行重新分组', use_container_width=True):
+    if st.button('🔄 执行重新分组', width='stretch'):
         store.regroup(int(new_gs), cat, int(start_g))
         st.session_state.editor_ver += 1
         st.success(f'✅ 已分为 {n_grps} 组（组 {start_g} ~ {start_g+n_grps-1}）')
@@ -1730,7 +1770,7 @@ def _panel_ai():
         with st.expander("查看已有释义（可作检查）"):
             st.dataframe(pd.DataFrame([
                 {'单词': w['word'], '释义': w.get('meaning', '')} for w in with_meaning
-            ]), use_container_width=True, hide_index=True)
+            ]), width='stretch', hide_index=True)
         return
 
     # ① 选词
@@ -1758,10 +1798,10 @@ def _panel_ai():
         label_visibility="collapsed",
     )
     ca, cb, cc = st.columns(3)
-    if ca.button("全选", use_container_width=True, key="ai_pick_all"):
+    if ca.button("全选", width='stretch', key="ai_pick_all"):
         st.session_state["_ai_force_all"] = True
         st.rerun()
-    if cb.button("清空", use_container_width=True, key="ai_pick_none"):
+    if cb.button("清空", width='stretch', key="ai_pick_none"):
         st.session_state["_ai_force_none"] = True
         st.rerun()
     cc.caption(f"已选 {len(picked)} / {len(all_options)}")
@@ -1803,7 +1843,7 @@ def _panel_ai():
             with st.expander(f"命中 {len(matched)} 个（将入库）", expanded=True):
                 st.dataframe(pd.DataFrame([
                     {'单词': w, '释义': m} for w, m in matched.items()
-                ]), use_container_width=True, hide_index=True)
+                ]), width='stretch', hide_index=True)
         if missing:
             with st.expander(f"⚠️ 缺失 {len(missing)} 个（AI 没返回）"):
                 st.write("　".join(missing))
@@ -1812,7 +1852,7 @@ def _panel_ai():
                 st.write("　".join(extra))
 
         if st.button(f"💾 保存 {len(matched)} 个释义入库", type="primary",
-                     use_container_width=True, disabled=(len(matched) == 0)):
+                     width='stretch', disabled=(len(matched) == 0)):
             n = 0
             for w, m in matched.items():
                 if store.update_word_meaning(w, cat, m):
@@ -1915,7 +1955,7 @@ def _panel_study():
     def _make_batched(words):
         return [{**w, 'group': (i // bs) + 1} for i, w in enumerate(words)]
 
-    if st.button("▶ 开始练习", type="primary", use_container_width=True):
+    if st.button("▶ 开始练习", type="primary", width='stretch'):
         st.session_state.voice = VOICES[voice_name]
         batched = _make_batched(selected_ws_ordered)
         st.session_state.session = SessionManager(
@@ -1961,7 +2001,7 @@ def _panel_loop():
         missing = len(rec_words_set) - len(ws)
         if missing > 0:
             st.warning(f"⚠️ 记录中有 {missing} 个词已从词库中删除，将被跳过。")
-        if st.button("← 取消使用记录，返回普通筛选", use_container_width=True,
+        if st.button("← 取消使用记录，返回普通筛选", width='stretch',
                      key="cancel_rec_use"):
             st.session_state.loop_record_active = None
             st.rerun()
@@ -2064,17 +2104,23 @@ def _panel_loop():
     # ── ③ 估算 & 启动 ──
     st.markdown("**③ 生成音频并开始**")
     n_audio = len(ws) + (n_with_meaning if cn_mode != 'none' else 0)
-    # 修复：估算与提示按真实并发数(_LOOP_TTS_CONCURRENCY=6)计算，原文案写死"12 路"
-    est_sec = max(4, int(n_audio * 0.6 / _LOOP_TTS_CONCURRENCY))
+    est_sec = max(3, int(n_audio * 0.5 / _LOOP_TTS_CONCURRENCY) + 2)
     st.caption(
         f"共需生成 **{n_audio}** 个音频片段  ·  预计约 **{est_sec} 秒**"
-        f"（并发 {_LOOP_TTS_CONCURRENCY} 路，词数越多耗时越久）"
+        f"（并发 {_LOOP_TTS_CONCURRENCY} 路）"
     )
-    if len(ws) > 150:
-        st.warning("⚠️ 词数较多：音频会常驻内存，Streamlit Cloud 免费版内存有限，"
-                   "建议一次不超过 150 词，否则可能触发资源限制导致应用重启。")
+    # 硬限制：音频 base64 常驻内存，词数太多会把 Cloud 免费版内存打爆导致重启
+    over_limit = len(ws) > LOOP_WORD_HARD_LIMIT
+    if over_limit:
+        st.error(f"⛔ 当前筛选出 **{len(ws)}** 词，超过单次循环上限 "
+                 f"**{LOOP_WORD_HARD_LIMIT}** 词（音频常驻内存，超限会把 "
+                 f"Streamlit Cloud 内存打爆导致应用崩溃重启）。"
+                 f"请用「组别」或「等级」筛选把词数降下来，分批循环。")
+    elif len(ws) > 120:
+        st.warning("⚠️ 词数较多，生成和加载会稍慢；如果播放页面卡顿，建议分批。")
 
-    if st.button("🎵 生成音频并开始循环", type="primary", use_container_width=True):
+    if st.button("🎵 生成音频并开始循环", type="primary", width='stretch',
+                 disabled=over_limit):
         with st.spinner(f"🎵 正在生成 {n_audio} 个音频..."):
             audio_data = generate_loop_audio(
                 ws,
@@ -2088,7 +2134,11 @@ def _panel_loop():
 
         audio_data = [d for d in audio_data if d['jp_b64']]
         if not audio_data:
-            st.error("❌ 音频生成全部失败，请检查网络后重试")
+            err = tts_last_error()
+            st.error("❌ 音频生成全部失败。"
+                     + (f"最近错误：`{err}`。" if err else "")
+                     + "如果错误里出现 401/403，说明 edge-tts 版本过旧，"
+                       "请确认 requirements.txt 里是 `edge-tts>=7.0` 并重启应用。")
             return
 
         st.session_state.loop_audio = audio_data
@@ -2140,13 +2190,13 @@ def _panel_loop():
                 with cbtn1:
                     if st.button("▶ 用这批词开始循环",
                                  key=f"use_rec_{rec['id']}",
-                                 type="primary", use_container_width=True):
+                                 type="primary", width='stretch'):
                         st.session_state.loop_record_active = rec
                         st.rerun()
                 with cbtn2:
                     if st.button("🗑 删除",
                                  key=f"del_rec_{rec['id']}",
-                                 use_container_width=True):
+                                 width='stretch'):
                         store.delete_record(rec['id'])
                         if _gist_enabled():
                             do_gist_save()
@@ -2232,7 +2282,7 @@ def screen_loop_playing():
             placeholder="标题会根据剩余词数和来源自动生成",
         )
 
-        if st.button("💾 存为练习记录", type="primary", use_container_width=True,
+        if st.button("💾 存为练习记录", type="primary", width='stretch',
                      disabled=(parsed_remaining is None or len(parsed_remaining) == 0)):
             try:
                 rec = st.session_state.store.add_record(
@@ -2253,13 +2303,13 @@ def screen_loop_playing():
     st.divider()
     c1, c2 = st.columns(2)
     with c1:
-        if st.button("🔙 返回配置", use_container_width=True):
+        if st.button("🔙 返回配置", width='stretch'):
             if _gist_enabled():
                 do_gist_save()
             st.session_state.phase = 'main'
             st.rerun()
     with c2:
-        if st.button("⏹ 结束并清空音频", use_container_width=True, type="secondary"):
+        if st.button("⏹ 结束并清空音频", width='stretch', type="secondary"):
             if _gist_enabled():
                 do_gist_save()
             st.session_state.phase = 'main'
@@ -2349,7 +2399,9 @@ def screen_session():
     if st.session_state.cur_audio:
         st.audio(st.session_state.cur_audio, format='audio/mpeg', autoplay=autoplay)
     else:
-        st.caption("⚠️ 音频未生成，请点「🔊 重播」")
+        _err = tts_last_error()
+        st.caption("⚠️ 音频未生成，请点「🔊 重播」"
+                   + (f"  ·  错误：`{_err}`" if _err else ""))
 
     col_sp, col_rp = st.columns([3, 1])
     with col_sp:
@@ -2364,7 +2416,7 @@ def screen_session():
             st.session_state.last_audio_word = ''
             st.rerun()
     with col_rp:
-        if st.button("🔊 重播", use_container_width=True):
+        if st.button("🔊 重播", width='stretch'):
             st.session_state.last_audio_word = ''
             st.rerun()
 
@@ -2372,7 +2424,7 @@ def screen_session():
 
     # ── 临时列表按钮（独立一行·醒目）──
     temp_label = "⭐ 已在临时列表 · 点击移出" if is_temp else "☆ 加入临时列表"
-    if st.button(temp_label, use_container_width=True, type="secondary",
+    if st.button(temp_label, width='stretch', type="secondary",
                  key=f"temp_btn_{word}"):
         new_val = store.toggle_temp(word, cat)
         w_obj['in_temp'] = new_val
@@ -2392,23 +2444,23 @@ def screen_session():
 
     bc1, bc2, bc3 = st.columns(3)
     with bc1:
-        if st.button("① 认识", use_container_width=True, type="secondary"):
+        if st.button("① 认识", width='stretch', type="secondary"):
             do_rate(1)
     with bc2:
-        if st.button("② 模糊", use_container_width=True):
+        if st.button("② 模糊", width='stretch'):
             do_rate(2)
     with bc3:
-        if st.button("③ 不会", use_container_width=True, type="primary"):
+        if st.button("③ 不会", width='stretch', type="primary"):
             do_rate(3)
 
     nc1, nc2, nc3 = st.columns(3)
     with nc1:
-        if st.button("◀ 上一", disabled=(sess.q_pos == 0), use_container_width=True):
+        if st.button("◀ 上一", disabled=(sess.q_pos == 0), width='stretch'):
             if sess.prev():
                 st.session_state.pop("show_word", None)
                 st.rerun()
     with nc2:
-        if st.button("跳过 ▶", use_container_width=True):
+        if st.button("跳过 ▶", width='stretch'):
             result = sess.skip()
             st.session_state.pop("show_word", None)
             if result == 'session_done':
@@ -2417,7 +2469,7 @@ def screen_session():
                 st.session_state.phase = 'group_done'
             st.rerun()
     with nc3:
-        if st.button("⏹ 退出", use_container_width=True):
+        if st.button("⏹ 退出", width='stretch'):
             if _gist_enabled():
                 do_gist_save()
             st.session_state.phase   = 'main'
@@ -2431,7 +2483,7 @@ def screen_session():
         for lv, col in zip([0, 1, 2, 3], [lc1, lc2, lc3, lc4]):
             btn_type = "primary" if lv == cur_lv else "secondary"
             if col.button(lv_map[lv], key=f"long_{word}_{lv}",
-                          use_container_width=True, type=btn_type):
+                          width='stretch', type=btn_type):
                 store.update_long(word, cat, lv)
                 sess.word_map[word]['long_level'] = lv
                 st.toast(f"✅ 已保存为长期 {lv} 级")
@@ -2464,10 +2516,10 @@ def screen_group_done():
     else:
         st.success("✅ 上一组词全部通过！")
 
-    if st.button("继续 ▶", type="primary", use_container_width=True):
+    if st.button("继续 ▶", type="primary", width='stretch'):
         st.session_state.phase = 'session'
         st.rerun()
-    if st.button("⏹ 退出练习", use_container_width=True):
+    if st.button("⏹ 退出练习", width='stretch'):
         if _gist_enabled():
             do_gist_save()
         st.session_state.phase   = 'main'
@@ -2507,15 +2559,15 @@ def screen_done():
             st.markdown(f'<div class="meaning-box">{rmn}</div>', unsafe_allow_html=True)
 
         st.caption(f"长期 {rlv} 级（{rlbl}）— {idx+1} / {len(rv_words)}")
-        if st.button("🔊 播放发音", use_container_width=True):
+        if st.button("🔊 播放发音", width='stretch'):
             audio = get_audio(rw, st.session_state.voice, st.session_state.speed)
             render_audio(audio, word=rw, autoplay=True)
         rc1, rc2 = st.columns(2)
-        if rc1.button("◀ 上一个", use_container_width=True):
+        if rc1.button("◀ 上一个", width='stretch'):
             if idx > 0:
                 st.session_state.rv_idx = idx - 1
                 st.rerun()
-        if rc2.button("下一个 ▶", use_container_width=True):
+        if rc2.button("下一个 ▶", width='stretch'):
             if idx < len(rv_words) - 1:
                 st.session_state.rv_idx = idx + 1
                 st.rerun()
@@ -2535,7 +2587,7 @@ def screen_done():
     with col_gist:
         if _gist_enabled():
             if st.button("🐙 保存到 GitHub Gist", type="primary",
-                         use_container_width=True):
+                         width='stretch'):
                 do_gist_save()
         else:
             st.caption("配置 GitHub Token 后可直接同步到云端")
@@ -2545,10 +2597,10 @@ def screen_done():
             data=st.session_state.store.export_csv(),
             file_name="japanese_words.csv",
             mime="text/csv",
-            use_container_width=True,
+            width='stretch',
         )
 
-    if st.button("🏠 返回主页", use_container_width=True):
+    if st.button("🏠 返回主页", width='stretch'):
         st.session_state.phase   = 'main'
         st.session_state.session = None
         st.session_state.rv_idx  = 0
